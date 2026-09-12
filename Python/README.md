@@ -50,7 +50,7 @@ Endpoints:
 | Method | Path | Use |
 | --- | --- | --- |
 | GET | `/v1/models` | List `stella-v`, `stella-v-1.5b`, `stella-v-3b`, `stella-v-local` |
-| POST | `/v1/chat/completions` | Chat + streaming + tool calls |
+| POST | `/v1/chat/completions` | Chat + streaming + tool calls. Script requests return a `write` tool call so OpenCode can create the file; Stella only retrieves ScienceOpen evidence. |
 | POST | `/v1/responses` | OpenAI Responses API |
 | POST | `/v1/completions` | Legacy completions |
 | POST | `/v1/embeddings` | Tensor-engine embeddings |

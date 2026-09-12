@@ -11,6 +11,14 @@ from __future__ import annotations
 import os
 from typing import Any, Sequence
 
+from artifact import (
+    build_code_prompt,
+    extract_fenced_code,
+    fallback_research_script,
+    looks_like_artifact_request,
+    looks_like_source,
+    research_query_from,
+)
 from scienceopen import search_europepmc_scienceopen, search_scienceopen
 from tensor_engine import RetrievedChunk, TensorEngine, get_engine
 
@@ -91,7 +99,36 @@ def build_reason_prompt(question: str, hits: Sequence[RetrievedChunk], *, local_
     )
 
 
-def _reason_with_ollama(prompt: str, size: str) -> str:
+def retrieve_for_question(
+    question: str,
+    *,
+    engine: TensorEngine | None = None,
+    live_search: bool = True,
+    k: int = 6,
+    search_query: str | None = None,
+) -> dict[str, Any]:
+    engine = engine or get_engine()
+    query = (search_query or question).strip() or question
+    live: list[dict[str, Any]] = []
+    errors: list[str] = []
+    if live_search:
+        try:
+            live = search_scienceopen(query, rows=max(8, k))
+        except Exception as exc:
+            errors.append(f"scienceopen:{exc}")
+            try:
+                live = search_europepmc_scienceopen(query, rows=max(8, k))
+            except Exception as exc2:
+                errors.append(f"europepmc:{exc2}")
+        if live:
+            engine.add_many(live)
+    packed = engine.select_for_reasoner(query, k=k, extra=live)
+    packed["live_count"] = len(live)
+    packed["errors"] = errors
+    return packed
+
+
+def _reason_with_ollama(prompt: str, size: str, *, max_tokens: int = 640, num_ctx: int = 4096) -> str:
     import agent_client
 
     model = ollama_model_for(size)
@@ -100,36 +137,15 @@ def _reason_with_ollama(prompt: str, size: str) -> str:
         agent_client.MODEL_NAME = model
         if not agent_client.is_alive():
             raise RuntimeError(f"Ollama is not reachable at {agent_client.OLLAMA_BASE}")
-        return agent_client.generate(prompt, temperature=0.15, max_tokens=640, num_ctx=4096)
+        return agent_client.generate(
+            prompt,
+            temperature=0.15,
+            max_tokens=max_tokens,
+            num_ctx=num_ctx,
+            include_system=False,
+        )
     finally:
         agent_client.MODEL_NAME = previous
-
-
-def retrieve_for_question(
-    question: str,
-    *,
-    engine: TensorEngine | None = None,
-    live_search: bool = True,
-    k: int = 6,
-) -> dict[str, Any]:
-    engine = engine or get_engine()
-    live: list[dict[str, Any]] = []
-    errors: list[str] = []
-    if live_search:
-        try:
-            live = search_scienceopen(question, rows=max(8, k))
-        except Exception as exc:
-            errors.append(f"scienceopen:{exc}")
-            try:
-                live = search_europepmc_scienceopen(question, rows=max(8, k))
-            except Exception as exc2:
-                errors.append(f"europepmc:{exc2}")
-        if live:
-            engine.add_many(live)
-    packed = engine.select_for_reasoner(question, k=k, extra=live)
-    packed["live_count"] = len(live)
-    packed["errors"] = errors
-    return packed
 
 
 def reason(
@@ -140,19 +156,42 @@ def reason(
     local_draft: str = "",
     live_search: bool = True,
     k: int = 6,
+    transcript: str = "",
 ) -> dict[str, Any]:
     size = normalize_reason_size(size)
-    retrieved = retrieve_for_question(question, engine=engine, live_search=live_search, k=k)
+    artifact = looks_like_artifact_request(question)
+    search_query = research_query_from(question, transcript) if artifact else question
+    retrieved = retrieve_for_question(
+        question, engine=engine, live_search=live_search, k=k, search_query=search_query,
+    )
     hits: list[RetrievedChunk] = list(retrieved.get("hits") or [])
-    prompt = build_reason_prompt(question, hits, local_draft=local_draft)
+    if artifact:
+        prompt = build_code_prompt(question, hits, local_draft=local_draft)
+        max_tokens, num_ctx = 1536, 8192
+    else:
+        prompt = build_reason_prompt(question, hits, local_draft=local_draft)
+        max_tokens, num_ctx = 640, 4096
     source = f"reasoner:{size}:{ollama_model_for(size)}"
     text = ""
     error = ""
     try:
-        text = _reason_with_ollama(prompt, size)
+        text = _reason_with_ollama(prompt, size, max_tokens=max_tokens, num_ctx=num_ctx)
+        if artifact:
+            code = extract_fenced_code(text)
+            if not code and looks_like_source(text):
+                code = text.strip()
+            if code:
+                text = code
+                source = f"reasoner-artifact:{size}:{ollama_model_for(size)}"
+            else:
+                text = fallback_research_script(question, hits)
+                source = "artifact-fallback"
     except Exception as exc:
         error = str(exc)
-        if hits:
+        if artifact:
+            text = fallback_research_script(question, hits)
+            source = "artifact-fallback"
+        elif hits:
             top = hits[0]
             text = (
                 f"From ScienceOpen preprint {top.title} ({top.doi or 'DOI n/a'}): "
@@ -170,7 +209,9 @@ def reason(
                 "Index medical preprints first, or start Ollama with qwen2.5:1.5b / qwen2.5:3b."
             )
             source = "fallback"
-    confidence = 0.82 if source.startswith("reasoner:") and text else 0.58
+    confidence = 0.82 if source.startswith("reasoner") and text else 0.58
+    if source.startswith("artifact"):
+        confidence = 0.74
     if hits:
         confidence = min(0.94, max(confidence, 0.55 + max(0.0, hits[0].score) * 0.2))
     return {
@@ -184,4 +225,5 @@ def reason(
         "live_count": retrieved.get("live_count", 0),
         "error": error,
         "prompt": prompt,
+        "artifact": artifact,
     }

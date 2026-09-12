@@ -181,9 +181,10 @@ def generate(
     seed: int | None = None,
     num_ctx: int | None = None,
     stop: Iterable[str] | None = None,
+    include_system: bool = True,
 ) -> str:
     """Single-turn generation through Ollama /api/generate."""
-    full_prompt = SYSTEM_PROMPT + "\n\n" + prompt
+    full_prompt = (SYSTEM_PROMPT + "\n\n" + prompt) if include_system else prompt
     payload: dict[str, Any] = {
         "model": MODEL_NAME,
         "prompt": full_prompt,

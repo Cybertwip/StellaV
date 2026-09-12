@@ -96,7 +96,15 @@ Models:
 - `stella-v-3b` — 3B reasoner + retrieval
 - `stella-v-local` — tensor memory only, no Ollama
 
-When the client sends tools (OpenCode’s bash/edit tools), Stella forwards them to the reasoner and returns OpenAI `tool_calls`. Without tools, it retrieves ScienceOpen passages and answers from that evidence.
+When the client sends tools (OpenCode’s bash/edit/write tools), Stella forwards them to the reasoner and returns OpenAI `tool_calls`. Without tools, it retrieves ScienceOpen passages and answers from that evidence.
+
+Stella itself does not write files. It **pushes retrieved preprint evidence**. If OpenCode (or another client) asks the **1.5B or 3B** model to write a script, Stella:
+
+1. Searches ScienceOpen for the scientific topic (not the words “write a python script”).
+2. Drafts the file from those passages (computational research prototype only).
+3. Returns a `write` tool call so OpenCode creates the file.
+
+That is how a request like “write a python chempy script … based on the research” is supposed to work with `stella-v-1.5b`. Stella will not stop at “therefore the answer is to use mRNA technology.” The drafted program is a research sketch grounded in unreviewed preprints — not a real vaccine, not manufacturing, and not clinical advice.
 
 ### Curl
 

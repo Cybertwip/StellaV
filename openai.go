@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -411,6 +412,13 @@ func (s *guiServer) completeOpenAI(req openaiChatRequest) (openaiChatResponse, e
 		cfg.Mode = RuntimeLocalOnly
 		cfg.LiveSearch = false
 	}
+	if looksLikeArtifactRequest(userText) {
+		if write, ok := findWriteTool(req.Tools); ok {
+			return s.completeArtifactWrite(cfg, req, userText, write)
+		}
+		pred := NewReplyEngine(s.model, cfg).Reply(userText)
+		return chatFromPrediction(modelID, userText, pred), nil
+	}
 	if len(req.Tools) > 0 && !localOnly {
 		chat, err := s.completeWithTools(cfg, req, userText)
 		if err == nil {
@@ -423,6 +431,10 @@ func (s *guiServer) completeOpenAI(req openaiChatRequest) (openaiChatResponse, e
 		userText = transcript + "\n\nLatest user message: " + lastUserText(req.Messages)
 	}
 	pred := engine.Reply(userText)
+	return chatFromPrediction(modelID, userText, pred), nil
+}
+
+func chatFromPrediction(modelID, userText string, pred Prediction) openaiChatResponse {
 	content, _ := json.Marshal(pred.Text)
 	promptTok := utf8.RuneCountInString(userText)
 	compTok := utf8.RuneCountInString(pred.Text)
@@ -444,19 +456,91 @@ func (s *guiServer) completeOpenAI(req openaiChatRequest) (openaiChatResponse, e
 			CompletionTokens: compTok,
 			TotalTokens:      promptTok + compTok,
 		},
+	}
+}
+
+func (s *guiServer) completeArtifactWrite(cfg ConquerorConfig, req openaiChatRequest, userText string, write openaiTool) (openaiChatResponse, error) {
+	transcript := conversationTranscript(req.Messages)
+	query := researchQueryFrom(userText, transcript)
+	if cfg.LiveSearch && cfg.Mode != RuntimeLocalOnly {
+		_, _ = indexScienceOpenIntoModel(s.model, query, 6)
+	}
+	hits := NewTensorEngine().Search(query, s.model.Chunks, nil, 6)
+	if len(hits) == 0 {
+		hits = NewTensorEngine().Search(userText, s.model.Chunks, s.model.Samples, 6)
+	}
+	if ev := selectArtifactEvidence(userText, transcript, hits); ev.Chunk.DOI != "" || ev.Chunk.Text != "" {
+		hits = prependHit(hits, ev)
+	}
+	local := s.model.Predict(query)
+	code := ""
+	if cfg.Mode != RuntimeLocalOnly && ollamaAlive() {
+		prompt := s.model.BuildCodePrompt(userText, local, hits)
+		n := req.MaxTokens
+		if n < 1024 {
+			n = 1536
+		}
+		if n > 2048 {
+			n = 2048
+		}
+		timeout := cfg.Timeout
+		if timeout <= 0 {
+			timeout = 90 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		if reply, err := queryOllamaPredict(ctx, ollamaModelFor(cfg.ReasonSize), prompt, n); err == nil {
+			code = extractFencedCode(reply)
+			if code == "" && looksLikeSource(reply) {
+				code = strings.TrimSpace(reply)
+			}
+		}
+	}
+	if strings.TrimSpace(code) == "" {
+		code = fallbackResearchScript(userText, hits, transcript)
+	}
+	path := inferArtifactPath(userText)
+	note, _ := json.Marshal(artifactAssistantNote(path, hits))
+	msg := openaiMessage{
+		Role:      "assistant",
+		Content:   note,
+		ToolCalls: []openaiToolCall{synthesizeWriteCall(write, path, code)},
+	}
+	modelID := firstNonEmpty(req.Model, openAIModelAuto)
+	promptTok := utf8.RuneCountInString(userText)
+	compTok := utf8.RuneCountInString(code)
+	return openaiChatResponse{
+		ID:      newOpenAIID("chatcmpl-"),
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   modelID,
+		Choices: []openaiChatChoice{{
+			Index:        0,
+			Message:      msg,
+			FinishReason: "tool_calls",
+		}},
+		Usage: openaiUsage{
+			PromptTokens:     promptTok,
+			CompletionTokens: compTok,
+			TotalTokens:      promptTok + compTok,
+		},
 	}, nil
 }
 
 func (s *guiServer) completeWithTools(cfg ConquerorConfig, req openaiChatRequest, userText string) (openaiChatResponse, error) {
 	rag := ""
-	if looksMedical(userText) {
-		hits := NewTensorEngine().Search(userText, s.model.Chunks, s.model.Samples, 4)
+	if looksMedical(userText) || looksLikeArtifactRequest(userText) {
+		searchQ := userText
+		if looksLikeArtifactRequest(userText) {
+			searchQ = researchQueryFrom(userText, conversationTranscript(req.Messages))
+		}
+		hits := NewTensorEngine().Search(searchQ, s.model.Chunks, s.model.Samples, 4)
 		if cfg.LiveSearch {
-			_, _ = indexScienceOpenIntoModel(s.model, userText, 4)
-			hits = NewTensorEngine().Search(userText, s.model.Chunks, s.model.Samples, 4)
+			_, _ = indexScienceOpenIntoModel(s.model, searchQ, 4)
+			hits = NewTensorEngine().Search(searchQ, s.model.Chunks, s.model.Samples, 4)
 		}
 		if len(hits) > 0 {
-			rag = "Retrieved ScienceOpen evidence:\n" + formatRankedPassages(hits, 4)
+			rag = "Retrieved ScienceOpen evidence (use this to ground any script or answer; do not stop at a summary if the user asked for a file):\n" + formatRankedPassages(hits, 4)
 		}
 	}
 	reply, err := queryOllamaChat(cfg, req.Messages, req.Tools, rag, req.MaxTokens)

@@ -52,13 +52,31 @@ func NewReplyEngine(model *StellaModel, cfg ConquerorConfig) ReplyEngine {
 
 func (e ReplyEngine) Reply(prompt string) Prediction {
 	cfg := e.conqueror.normalized()
-	if cfg.LiveSearch && cfg.Mode != RuntimeLocalOnly {
-		_, _ = indexScienceOpenIntoModel(e.model, prompt, 6)
+	searchQ := prompt
+	artifact := looksLikeArtifactRequest(prompt)
+	if artifact {
+		searchQ = researchQueryFrom(prompt, "")
 	}
-	local := e.model.Predict(prompt)
-	hits := NewTensorEngine().Search(prompt, e.model.Chunks, e.model.Samples, 6)
+	if cfg.LiveSearch && cfg.Mode != RuntimeLocalOnly {
+		_, _ = indexScienceOpenIntoModel(e.model, searchQ, 6)
+	}
+	local := e.model.Predict(searchQ)
+	hits := NewTensorEngine().Search(searchQ, e.model.Chunks, nil, 6)
+	if len(hits) == 0 {
+		hits = NewTensorEngine().Search(searchQ, e.model.Chunks, e.model.Samples, 6)
+	}
+	if len(hits) == 0 && searchQ != prompt {
+		hits = NewTensorEngine().Search(prompt, e.model.Chunks, e.model.Samples, 6)
+	}
 	if cfg.Mode == RuntimeLocalOnly {
+		if artifact {
+			text := fallbackResearchScript(prompt, hits)
+			return Prediction{Text: text, Confidence: 0.7, Tokens: tokenize(text), Source: "artifact-fallback"}
+		}
 		return local
+	}
+	if artifact {
+		return e.replyArtifact(prompt, local, hits)
 	}
 	if local.Source == "memory" && local.Confidence >= 0.97 {
 		return local
@@ -96,13 +114,42 @@ func (e ReplyEngine) Reply(prompt string) Prediction {
 }
 
 func (e ReplyEngine) queryReasoner(prompt string) (string, error) {
+	return e.queryReasonerPredict(prompt, 512)
+}
+
+func (e ReplyEngine) queryReasonerPredict(prompt string, numPredict int) (string, error) {
 	cfg := e.conqueror.normalized()
 	if !ollamaAlive() {
 		return "", errors.New("ollama is not reachable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
 	defer cancel()
-	return queryOllama(ctx, ollamaModelFor(cfg.ReasonSize), prompt)
+	return queryOllamaPredict(ctx, ollamaModelFor(cfg.ReasonSize), prompt, numPredict)
+}
+
+func (e ReplyEngine) replyArtifact(prompt string, local Prediction, hits []RankedChunk) Prediction {
+	codePrompt := e.model.BuildCodePrompt(prompt, local, hits)
+	if reply, err := e.queryReasonerPredict(codePrompt, 1536); err == nil && strings.TrimSpace(reply) != "" {
+		code := extractFencedCode(reply)
+		if code == "" && looksLikeSource(reply) {
+			code = strings.TrimSpace(reply)
+		}
+		if code != "" {
+			return Prediction{
+				Text:       code,
+				Confidence: maxFloat(local.Confidence, 0.8),
+				Tokens:     tokenize(code),
+				Source:     "reasoner-artifact:" + e.conqueror.normalized().ReasonSize,
+			}
+		}
+	}
+	text := fallbackResearchScript(prompt, hits)
+	return Prediction{
+		Text:       text,
+		Confidence: 0.72,
+		Tokens:     tokenize(text),
+		Source:     "artifact-fallback",
+	}
 }
 
 func (e ReplyEngine) Status() map[string]any {

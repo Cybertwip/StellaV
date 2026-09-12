@@ -62,10 +62,12 @@ func reasonerSystemPrompt() string {
 
 func agentSystemPrompt() string {
 	return strings.Join([]string{
-		"You are Stella V, a self-contained local agent with OpenAI-compatible tool calling.",
-		"Use the provided tools to complete the user's request. Prefer tools over guessing.",
-		"When medical or scientific evidence is relevant, use retrieved ScienceOpen context and cite DOIs.",
-		"This is not diagnosis or treatment advice.",
+		"You are Stella V, a local medical-research assistant with OpenAI-compatible tool calling.",
+		"You retrieve ScienceOpen preprints and push that evidence into context. You do not write files to disk.",
+		"When the client (OpenCode) provides write, edit, or bash tools, use those tools to fulfill script and file requests.",
+		"Prefer tools over guessing. Do not replace a requested script with a literature summary.",
+		"When medical evidence is relevant, cite ScienceOpen DOIs. Treat preprints as unreviewed.",
+		"This is not diagnosis or treatment advice. Computational research code is not a therapy or manufacturing protocol.",
 		"Return a concise final answer when no further tool call is needed.",
 	}, " ")
 }
@@ -122,6 +124,13 @@ type ollamaGenerateResponse struct {
 }
 
 func queryOllama(ctx context.Context, model, prompt string) (string, error) {
+	return queryOllamaPredict(ctx, model, prompt, 512)
+}
+
+func queryOllamaPredict(ctx context.Context, model, prompt string, numPredict int) (string, error) {
+	if numPredict <= 0 {
+		numPredict = 512
+	}
 	base := strings.TrimRight(envOr("STELLAV_OLLAMA_BASE", defaultOllamaBase), "/")
 	body, err := json.Marshal(ollamaGenerateRequest{
 		Model:  model,
@@ -129,8 +138,8 @@ func queryOllama(ctx context.Context, model, prompt string) (string, error) {
 		Stream: false,
 		Options: map[string]any{
 			"temperature": 0.15,
-			"num_predict": 512,
-			"num_ctx":     4096,
+			"num_predict": numPredict,
+			"num_ctx":     8192,
 		},
 	})
 	if err != nil {
@@ -214,12 +223,33 @@ type ollamaChatResponse struct {
 	Error   string        `json:"error"`
 }
 
+func collectClientSystem(messages []openaiMessage) string {
+	var b strings.Builder
+	for _, msg := range messages {
+		if strings.ToLower(strings.TrimSpace(msg.Role)) != "system" {
+			continue
+		}
+		text := flattenMessageContent(msg.Content)
+		if text == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(text)
+	}
+	return strings.TrimSpace(b.String())
+}
+
 func queryOllamaChat(cfg ConquerorConfig, messages []openaiMessage, tools []openaiTool, rag string, maxTokens int) (openaiMessage, error) {
 	if !ollamaAlive() {
 		return openaiMessage{}, fmt.Errorf("ollama is not reachable")
 	}
 	model := ollamaModelFor(cfg.ReasonSize)
 	sys := agentSystemPrompt()
+	if clientSys := collectClientSystem(messages); clientSys != "" {
+		sys += "\n\nClient instructions (honor these tool schemas):\n" + truncateRunes(clientSys, 2000)
+	}
 	if strings.TrimSpace(rag) != "" {
 		sys += "\n\n" + rag
 	}

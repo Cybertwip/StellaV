@@ -10,7 +10,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
-from reasoner import normalize_reason_size, ollama_model_for, reason
+from artifact import (
+    artifact_assistant_note,
+    extract_fenced_code,
+    fallback_research_script,
+    find_write_tool,
+    infer_artifact_path,
+    looks_like_artifact_request,
+    looks_like_source,
+    research_query_from,
+    select_artifact_evidence,
+    synthesize_write_call,
+)
+from reasoner import normalize_reason_size, ollama_model_for, reason, retrieve_for_question
 from tensor_engine import get_engine
 
 
@@ -31,6 +43,18 @@ def _flatten_content(content: Any) -> str:
                 parts.append(item)
         return "\n".join(parts).strip()
     return str(content).strip()
+
+
+def _transcript(messages: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for msg in messages:
+        role = str(msg.get("role") or "user")
+        text = _flatten_content(msg.get("content"))
+        if not text and msg.get("tool_calls"):
+            text = "[tool_calls]"
+        if text:
+            lines.append(f"{role}: {text}")
+    return "\n".join(lines).strip()
 
 
 def _last_user(messages: list[dict[str, Any]]) -> str:
@@ -107,20 +131,41 @@ class StellaOpenAIHandler(BaseHTTPRequestHandler):
             else:
                 messages = [{"role": "user", "content": str(prompt)}]
         question = _last_user(messages)
+        transcript = _transcript(messages)
         local_only = "local" in model.lower()
         size = "3b" if "3b" in model.lower() else "1.5b"
-        if local_only:
-            from persistent_kb import answer_from_kb, load_kb_into_tensor_engine
+        tools = list(body.get("tools") or [])
+        write_tool = find_write_tool(tools) if looks_like_artifact_request(question) else None
+        tool_calls: list[dict[str, Any]] | None = None
+        if write_tool is not None:
+            text, source, tool_calls = _artifact_write(question, transcript, write_tool, size, local_only)
+        elif local_only:
+            from persistent_kb import load_kb_into_tensor_engine
             from model import LinearTokenLanguageModel
 
             load_kb_into_tensor_engine()
             linear = LinearTokenLanguageModel()
             linear.load()
-            text, conf, _ = linear.predict(question)
-            source = "local"
-            _ = conf
+            if looks_like_artifact_request(question):
+                result = reason(
+                    question,
+                    size=normalize_reason_size(size),
+                    live_search=False,
+                    transcript=transcript,
+                )
+                text = result["text"]
+                source = result["source"]
+            else:
+                text, conf, _ = linear.predict(question)
+                source = "local"
+                _ = conf
         else:
-            result = reason(question, size=normalize_reason_size(size), live_search=True)
+            result = reason(
+                question,
+                size=normalize_reason_size(size),
+                live_search=True,
+                transcript=transcript,
+            )
             text = result["text"]
             source = result["source"]
         created = int(time.time())
@@ -142,6 +187,11 @@ class StellaOpenAIHandler(BaseHTTPRequestHandler):
                 }],
             })
             return
+        message: dict[str, Any] = {"role": "assistant", "content": text}
+        finish = "stop"
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+            finish = "tool_calls"
         payload = {
             "id": chat_id,
             "object": "chat.completion",
@@ -149,8 +199,8 @@ class StellaOpenAIHandler(BaseHTTPRequestHandler):
             "model": model,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
+                "message": message,
+                "finish_reason": finish,
             }],
             "usage": {"prompt_tokens": len(question.split()), "completion_tokens": len(text.split()), "total_tokens": 0},
             "stella_source": source,
@@ -164,17 +214,85 @@ class StellaOpenAIHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            chunk = {
-                "id": chat_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-            }
-            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
+            if tool_calls:
+                start = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                }
+                self.wfile.write(f"data: {json.dumps(start)}\n\n".encode("utf-8"))
+                chunk = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"tool_calls": tool_calls}, "finish_reason": None}],
+                }
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
+                done = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                }
+                self.wfile.write(f"data: {json.dumps(done)}\n\n".encode("utf-8"))
+            else:
+                chunk = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+                }
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
             self.wfile.write(b"data: [DONE]\n\n")
             return
         self._json(200, payload)
+
+
+def _artifact_write(
+    question: str,
+    transcript: str,
+    write_tool: dict[str, Any],
+    size: str,
+    local_only: bool,
+) -> tuple[str, str, list[dict[str, Any]]]:
+    if local_only:
+        try:
+            from persistent_kb import load_kb_into_tensor_engine
+
+            load_kb_into_tensor_engine()
+        except Exception:
+            pass
+        packed = retrieve_for_question(
+            question,
+            live_search=False,
+            search_query=research_query_from(question, transcript),
+        )
+        hits = list(packed.get("hits") or [])
+        code = fallback_research_script(question, hits, transcript)
+        source = "artifact-fallback"
+    else:
+        result = reason(
+            question,
+            size=normalize_reason_size(size),
+            live_search=True,
+            transcript=transcript,
+        )
+        hits = list(result.get("hits") or [])
+        code = result["text"]
+        if not looks_like_source(code):
+            extracted = extract_fenced_code(code)
+            code = extracted or fallback_research_script(question, hits, transcript)
+        source = str(result.get("source") or "reasoner-artifact")
+    ev = select_artifact_evidence(question, hits, transcript)
+    note_hits = [ev] if ev is not None else hits
+    path = infer_artifact_path(question)
+    note = artifact_assistant_note(path, note_hits)
+    return note, source, [synthesize_write_call(write_tool, path, code)]
 
 
 def serve_openai(addr: str = "127.0.0.1:8765") -> None:

@@ -113,6 +113,116 @@ func TestOpenAIResponsesAndStream(t *testing.T) {
 	}
 }
 
+func TestOpenAIArtifactReturnsWriteToolCall(t *testing.T) {
+	srv := testServer(t)
+	srv.model.AddChunk(
+		"10.14293/s2199-1006.1.sor-.ppsvhlh.v1",
+		"mRNA Vaccine: The Next Generation Vaccine Revolution in Medical Science & Vaccinology",
+		"RNA vaccines have potential as Novel therapeutic options for major disease such as cancer for development of personalized medicine.",
+		scienceOpenURL("10.14293/s2199-1006.1.sor-.ppsvhlh.v1"),
+		"scienceopen",
+	)
+	httpSrv := httptest.NewServer(srv.routes())
+	defer httpSrv.Close()
+
+	body := []byte(`{
+		"model":"stella-v-local",
+		"messages":[{"role":"user","content":"Write a python chempy script to begin a cancer vaccine."}],
+		"tools":[{
+			"type":"function",
+			"function":{
+				"name":"write",
+				"description":"Write a file",
+				"parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]}
+			}
+		}]
+	}`)
+	resp, err := http.Post(httpSrv.URL+"/v1/chat/completions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d: %s", resp.StatusCode, raw)
+	}
+	var payload openaiChatResponse
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Choices[0].FinishReason != "tool_calls" {
+		t.Fatalf("finish_reason %s body %s", payload.Choices[0].FinishReason, raw)
+	}
+	calls := payload.Choices[0].Message.ToolCalls
+	if len(calls) != 1 || calls[0].Function.Name != "write" {
+		t.Fatalf("tool calls %#v", calls)
+	}
+	var args map[string]string
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(args["file_path"], ".py") {
+		t.Fatalf("path %q", args["file_path"])
+	}
+	if !strings.Contains(args["content"], "chempy") {
+		t.Fatalf("script missing chempy: %s", args["content"][:min(200, len(args["content"]))])
+	}
+	if !strings.Contains(args["content"], "10.14293/s2199-1006.1.sor-.ppsvhlh.v1") {
+		t.Fatalf("script missing DOI")
+	}
+	if !strings.Contains(args["content"], "NOT a vaccine") {
+		t.Fatalf("script missing research disclaimer")
+	}
+	note := flattenMessageContent(payload.Choices[0].Message.Content)
+	if !strings.Contains(strings.ToLower(note), "scienceopen") {
+		t.Fatalf("assistant note should push retrieved evidence, got %q", note)
+	}
+}
+
+func TestOpenAIFollowUpScriptUsesConversationDOI(t *testing.T) {
+	srv := testServer(t)
+	httpSrv := httptest.NewServer(srv.routes())
+	defer httpSrv.Close()
+	body := []byte(`{
+		"model":"stella-v-local",
+		"messages":[
+			{"role":"user","content":"Write a python chempy script to begin a cancer vaccine."},
+			{"role":"assistant","content":"ScienceOpen preprint: 10.14293/s2199-1006.1.sor-.ppsvhlh.v1\nPassage: RNA vaccines have potential as Novel therapeutic options for cancer."},
+			{"role":"user","content":"Write the python script now, do that based on the research"}
+		],
+		"tools":[{
+			"type":"function",
+			"function":{
+				"name":"write",
+				"parameters":{"type":"object","properties":{"filePath":{"type":"string"},"content":{"type":"string"}},"required":["filePath","content"]}
+			}
+		}]
+	}`)
+	resp, err := http.Post(httpSrv.URL+"/v1/chat/completions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d: %s", resp.StatusCode, raw)
+	}
+	var payload openaiChatResponse
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Choices[0].Message.ToolCalls) != 1 {
+		t.Fatalf("expected write tool call, got %s", raw)
+	}
+	var args map[string]string
+	if err := json.Unmarshal([]byte(payload.Choices[0].Message.ToolCalls[0].Function.Arguments), &args); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := args["filePath"]; !ok {
+		t.Fatalf("expected camelCase filePath for OpenCode schema, got %#v", args)
+	}
+}
+
 func TestMapOpenAIModel(t *testing.T) {
 	size, local := mapOpenAIModel("stella-v-3b")
 	if size != Reason3B || local {
