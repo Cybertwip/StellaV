@@ -1,0 +1,32 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "stella/stella-v-1.5b",
+  "small_model": "stella/stella-v-1.5b",
+  "provider": {
+    "stella": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Stella V",
+      "options": {
+        "baseURL": "http://127.0.0.1:8765/v1",
+        "apiKey": "stella-local"
+      },
+      "models": {
+        "stella-v-1.5b": {
+          "name": "Stella V 1.5B",
+          "tool_call": true,
+          "limit": { "context": 8192, "output": 2048 }
+        },
+        "stella-v-3b": {
+          "name": "Stella V 3B",
+          "tool_call": true,
+          "limit": { "context": 8192, "output": 2048 }
+        },
+        "stella-v-local": {
+          "name": "Stella V tensor-only",
+          "tool_call": false,
+          "limit": { "context": 4096, "output": 512 }
+        }
+      }
+    }
+  }
+}

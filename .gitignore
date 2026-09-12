@@ -1,0 +1,48 @@
+# Local models and knowledge
+stella_model.json
+qa_linear_token_model.json
+stellav_knowledge_base.json
+agent_dataset.jsonl
+agent_teacher_vocab.json
+agent_vocab_usage_bootstrap.jsonl
+bootstrap_dataset.jsonl
+agent_confidence_log.json
+
+# Exports
+*.paccel
+*.safetensors
+*.onnx
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Go
+/Stella
+/stella
+/stella.exe
+*.test
+*.out
+vendor/
+
+# Tests / coverage
+coverage.out
+coverage.html
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
